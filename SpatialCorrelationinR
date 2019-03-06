@@ -1,0 +1,217 @@
+###STEP ONE: LOAD TOOLS & SET DATA DIRECTORY
+rm(list = ls()) #clears environment
+cat("\014") #clears console
+
+#install libraries
+library(rgdal)
+library(tmap)
+library(spdep)
+library(GISTools)
+library(RColorBrewer)
+library(spgwr)
+library(sp)
+
+#Set Data Location: 
+setwd("D:/AdvStat/final")
+
+# STEP 2: IMPORT DATA & JOIN TO GEOGRAPHY
+# Load shapefile & census data, convert factors to numeric
+census <- read.csv("census.csv", header=TRUE)
+census <- within(census, {
+  perc_rent_oc <- as.numeric(as.character(perc_rent_oc))
+  perc_own_oc <- as.numeric(as.character(perc_own_oc))
+  mhhinc <- as.numeric(as.character(mhhinc))
+  perblack <- as.numeric(as.character(perblack ))
+  perwhite <- as.numeric(as.character(perwhite ))
+})
+grad <- read.csv("grad.csv", header=TRUE)
+grad <- within(grad, {
+  percgrad <- as.numeric(as.character(percgrad))
+})
+tracts <- readOGR(dsn = "D:/AdvStat/final", layer = "Census_Tracts_2")
+
+# Join census file to shapefile
+tracts@data = data.frame(tracts@data, grad[match(tracts@data[,"GEOID10"], grad[,"FIPS.Code"]),])
+tracts@data = data.frame(tracts@data, census[match(tracts@data[,"GEOID10"], census[,"GEO.id2"]),])
+
+# Choropleth map of basic data
+par(mfrow=c(1,1))
+par(mar=c(0,0,0,0))
+tm_shape(tracts) + tm_borders(alpha = .2) + tm_polygons(col = 'percgrad', 
+  palette = 'Blues',title ="Percent Renter Occupied Homes", style = 'quantile')
+
+# STEP 3: MULTIPLE REGRESSION MODEL
+#correlation
+corr_subset <-as.data.frame(tracts)
+summary(corr_subset)
+
+#scatterplot matrix
+pairs(~census$perc_rent_oc+census$perblack+census$mhhinc+grad$percgrad, data=corr_subset, main="Scatterplot Matrix of Variables")
+
+#fit models
+mod.1<-lm(census$perc_rent_oc~census$mhhinc, data=tracts)
+mod.2<-lm(census$perc_rent_oc~grad$percgrad+census$mhhinc, data=tracts)
+mod.3<-lm(census$perc_rent_oc~census$perblack+census$mhhinc+grad$percgrad, data=tracts)
+
+#view results
+summary(mod.1)
+summary(mod.2)
+summary(mod.3)
+
+#postregression diagnostic plots
+par(mfrow=c(2,2))
+par(mar=c(0,0,0,0))
+plot(mod.1)
+plot(mod.2)
+plot(mod.3)
+
+# STEP 3: Geographically Weighted Regression
+#Histogram of Adoption
+hist(tracts$perc_rent_oc, col="grey", xlab = "Percentages", main = "Percent Renter Occupied")
+
+# Create linear model & summarize
+lin.mod<-lm(census$perc_rent_oc~census$perblack+census$mhhinc+grad$percgrad, data=tracts)
+summary(lin.mod)
+summary(lin.mod$residuals)
+
+#save residuals as column in data frame
+tracts$residuals <- NA
+tracts$residuals<-residuals(lin.mod)
+
+#plot choropleth map of residuals
+par(mfrow=c(1,1))
+par(mar=c(0,0,0,0))
+tm_shape(tracts) + tm_borders(alpha = .2) + 
+  tm_polygons(col = 'residuals', palette = 'PRGn', 
+              title =  'Residuals of Linear Model', style = 'quantile')
+
+# How clustered are those residuals? Do we have evidence of spatial dependency?
+# generate a neighbor plot to see distances from tract to tract and see clusters
+phl_neighbors <- poly2nb(tracts)
+phl_neighbors
+par(mfrow=c(1,1))
+plot(tracts, border="red")
+plot(phl_neighbors, coordinates(tracts), add=T)
+
+#Lagged Means
+phl_neighbors_lw <- nb2listw(phl_neighbors)
+rent <- tracts$perc_rent_oc
+lead_lagged_mean <- lag.listw(phl_neighbors_lw, rent)
+choropleth(tracts, lead_lagged_mean, shading =auto.shading(lead_lagged_mean))
+
+# Measurement of Clustering (Moran's I, etc)
+#Moran's I
+moran.range <- function(lw) {
+  wmat <- listw2mat(lw)
+  return(range(eigen((wmat + t(wmat))/2)$values))
+}
+moran.range(phl_neighbors_lw)
+moran.plot(tracts$perc_rent_oc, phl_neighbors_lw)
+moran.test(tracts$perc_rent_oc, phl_neighbors_lw)
+moran.mc(tracts$perc_rent_oc, phl_neighbors_lw, 10000)
+
+phl_LocI <- localmoran(tracts$perc_rent_oc, phl_neighbors_lw)
+phl_LocI
+
+#Visualize Moran's I
+bband.shade <- auto.shading(c(phl_LocI[,1],-phl_LocI[,1]),
+                            cols=brewer.pal(5,"PRGn")) 
+choropleth(tracts,phl_LocI[,1],shading=bband.shade)
+choro.legend(3675000,4300000,bband.shade,fmt="%4.2f")
+title("Renter Occupancy Rates (Local Moran's I)",cex.main=1) 
+map.scale(1000, 152000, miles2ft(2), "Miles", 4, 0.5, sfcol='red') 
+
+#Create bandwidth using linear model significant variables
+phl.bw = gwr.sel(census$perc_rent_oc~census$perblack+census$mhhinc+grad$percgrad, data = tracts, gweight = gwr.Gauss, verbose = F)
+#Derive, Summarize GWR
+phl.gwr = gwr(census$perc_rent_oc~census$perblack+census$mhhinc+grad$percgrad, data = tracts, bandwidth = phl.bw, gweight = gwr.Gauss, hatmatrix = T)
+summary(phl.gwr)
+
+# Get results of GWR (Spatial Data Frame - SDF) 
+df = slot(phl.gwr$SDF, "data")
+df
+gwrMap <- phl.gwr$SDF
+
+# Plot: spatial distribution of parameter estimates
+spplot(phl.gwr$SDF, "grad$percgrad", 
+       col.regions=colorRampPalette(c('red', 'gray80', 'blue'))(20), main='GWR Slope Value - High School Graduation Rate')
+spplot(phl.gwr$SDF, "census$mhhinc", 
+       col.regions=colorRampPalette(c('red', 'gray80', 'blue'))(20), main='GWR Slope Value - Median Household Income')
+spplot(phl.gwr$SDF, "census$perblack", 
+       col.regions=colorRampPalette(c('red', 'gray80', 'blue'))(20), main='GWR Slope Value - Percent Black')
+
+# Plot: spatial distribution of local r^2
+tracts$r2 <- df$localR2
+tm_shape(tracts) + tm_borders(alpha = .2) + 
+  tm_polygons(col = 'r2', palette = 'BuPu', 
+              title =  'R^2 of GWR for Percent High School Graduates', style = 'quantile')
+
+# STEP 4: SAR Model
+# create examples of random permutations
+# Set up the parameters - six plots in 3 rows by 2 cols
+# set margins as smaller than usual to allow bigger maps
+par(mfrow=c(3,2), mar=c(1,1,1,1)/2)
+
+# Which one will be the real data?
+real.data.i <- sample(1:6,1)
+
+# Draw six plots. Five will be random, one will be the real data. 
+shades <- auto.shading(tracts$perc_rent_oc, n=6, cols=brewer.pal(5,'Blues'))
+for (i in 1:6) {
+  if (i ==real.data.i) {
+    choropleth(tracts,tracts$percgrad,auto.shading)
+  }
+  else {
+    choropleth(tracts,sample(tracts$percgrad),auto.shading)
+  }
+}
+# reset par (mfrow)
+par(mfrow=c(1,1))
+
+# test - which is the real data?
+real.data.i
+
+# Calculate the Rook's case neighbors
+phl_rook <- poly2nb(tracts, queen=FALSE)
+# Plot the counties in the background
+plot(tracts, border='grey')
+# Plot the Rook's case neigbors
+plot(phl_rook, coordinates(tracts), add=TRUE, col='blue')
+
+# Convert the neighbor list into a listw object
+phl_lw <-nb2listw(phl_rook)
+phl_rook
+
+# Create lagged means choropleth
+phl_lm <- lag.listw(phl_lw, tracts$perc_rent_oc)
+choropleth(tracts, phl_lm, shades)
+
+# Lagged Means scatterplot
+plot(tracts$perc_rent_oc, phl_lm, asp=1, xlim=range(tracts$perc_rent_oc),ylim=range(tracts$perc_rent_oc))
+abline(a=0, b=1)
+abline(v=mean(tracts$perc_rent_oc),lty=2)
+abline(h=mean(phl_lm), lty=2)
+
+# Alternatively, Moran Plot
+moran.plot(tracts$perc_rent_oc, phl_lw)
+
+# STEP 5: MORAN'S I 
+moran.test(tracts$perc_rent_oc, phl_lw)
+moran.test(tracts$perc_rent_oc, phl_lw, randomisation = FALSE)
+
+# permutation test of Moran's I
+moran.mc(tracts$perc_rent_oc, phl_lw, 10000)
+
+# perform spatial autoregression using dependant variable and weighted neighbors
+sar.reg <- spautolm(census$perc_rent_oc~census$perblack+census$mhhinc+grad$percgrad, listw=phl_lw)
+
+#results
+sar.reg
+summary(sar.reg)
+
+# pull the lambda.se out to decide where the reported level of lambda is of importance
+sar.reg$lambda.se
+
+# an approx. 5% confidence interval can be found by adding and subtracting
+#twice the standard error from/to the estimate of lambda plus or minus
+sar.reg$lambda + c(-2,2)*sar.reg$lambda.se
